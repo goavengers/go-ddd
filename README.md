@@ -797,6 +797,46 @@ sequenceDiagram
     Kafka->>OrderService: SAGA_COMPLETE / SAGA_ROLLBACK
 ```
 
+## Пример реализации
+
+```go
+// OrderService - оркестратор SAGA
+type OrderService struct {
+    catalogClient *CatalogClient
+    paymentClient *PaymentClient
+}
+
+func (s *OrderService) CreateOrder(order Order) error {
+    // Шаг 1: Резервируем товары
+    if err := s.catalogClient.ReserveItems(order.Items); err != nil {
+        return fmt.Errorf("reservation failed: %w", err)
+    }
+    
+    // Шаг 2: Обрабатываем платеж
+    if err := s.paymentClient.Charge(order.UserID, order.Amount); err != nil {
+        // Компенсация: Отменяем резерв
+        if err := s.catalogClient.CancelReservation(order.Items); err != nil {
+            return fmt.Errorf("payment failed AND cancel failed: %w", err)
+        }
+        return fmt.Errorf("payment failed: %w", err)
+    }
+    
+    return nil
+}
+
+// CatalogClient
+func (c *CatalogClient) ReserveItems(items []Item) error {
+    // Логика резервирования в БД
+    return c.db.Exec("UPDATE items SET reserved = true WHERE id IN (...)")
+}
+
+// PaymentClient
+func (p *PaymentClient) Charge(userID string, amount float64) error {
+    // Логика обработки платежа
+    return p.http.Post("/charge", map[string]interface{}{...})
+}
+```
+
 ## Проблемы базовой реализации:
 
 - Нет защиты от **повторных запросов**
@@ -866,52 +906,303 @@ sequenceDiagram
 ### Idempotency Key (Идемпотентность)
 
 **Задача:** Предотвращение дублирования операций при повторных запросах.
-**Пример кода:**
-
-```go
-// Middleware для проверки ключа идемпотентности
-func IdempotencyMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        key := r.Header.Get("Idempotency-Key")
-        if cached := cache.Get(key); cached != nil {
-            respondWithCached(w, cached)
-            return
-        }
-        next.ServeHTTP(w, r)
-    })
-}
-```
 
 ### Circuit Breaker (Автоматический переключатель)
 
 **Задача:** Защита от каскадных ошибок при недоступности сервисов.
-**Пример кода:**
-
-```go
-// Настройка для Catalog Service
-cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
-    Name:    "CatalogService",
-    Timeout: 30 * time.Second,
-    ReadyToTrip: func(counts gobreaker.Counts) bool {
-        return counts.ConsecutiveFailures > 5
-    },
-})
-```
 
 ### Outbox Pattern (Надежная доставка событий)
 
 **Задача:** Гарантированная доставка событий даже при падении сервиса.
-**Пример кода:**
+
+### Прмер реализации
 
 ```go
-CREATE TABLE outbox (
-    id UUID PRIMARY KEY,
-    saga_id VARCHAR(255),
-    event_type VARCHAR(100),
-    payload JSONB,
-    created_at TIMESTAMP,
-    processed BOOLEAN DEFAULT false
-);
+package main
+
+package main
+
+import (
+"encoding/json"
+"errors"
+"fmt"
+"net/http"
+"sync"
+"time"
+)
+
+// 1. Основные структуры данных
+type Order struct {
+   ID     string  `json:"id"`
+   UserID string  `json:"user_id"`
+   Amount float64 `json:"amount"`
+   Items  []Item  `json:"items"`
+   Status string  `json:"status"`
+}
+
+type Item struct {
+   ID       string `json:"id"`
+   Quantity int    `json:"quantity"`
+}
+
+type Event struct {
+   Type          string      `json:"type"`
+   Payload       interface{} `json:"payload"`
+   SagaID        string      `json:"saga_id"`
+   IdempotencyKey string    `json:"idempotency_key"`
+}
+
+// 2. Order Service
+type OrderService struct {
+   db             *DB
+   outboxProcessor *OutboxProcessor
+   cache          *IdempotencyCache
+}
+
+func (s *OrderService) CreateOrder(w http.ResponseWriter, r *http.Request) {
+   // Генерация Idempotency Key
+   idempotencyKey := r.Header.Get("Idempotency-Key")
+   if idempotencyKey == "" {
+      idempotencyKey = generateUUID()
+   }
+
+   // Проверка идемпотентности
+   if cached, exists := s.cache.Get(idempotencyKey); exists {
+      respondJSON(w, cached)
+      return
+   }
+
+   // Парсинг заказа
+   var order Order
+   if err := json.NewDecoder(r.Body).Decode(&order); err != nil {
+      http.Error(w, err.Error(), http.StatusBadRequest)
+      return
+   }
+
+   // Сохранение заказа в БД
+   tx := s.db.Begin()
+   if err := tx.Create(&order).Error; err != nil {
+      tx.Rollback()
+      http.Error(w, err.Error(), http.StatusInternalServerError)
+      return
+   }
+
+   // Сохранение события в Outbox
+   event := Event{
+      Type:          "OrderCreated",
+      Payload:       order,
+      SagaID:        order.ID,
+      IdempotencyKey: idempotencyKey,
+   }
+
+   if err := s.outboxProcessor.SaveEvent(tx, event); err != nil {
+      tx.Rollback()
+      http.Error(w, err.Error(), http.StatusInternalServerError)
+      return
+   }
+
+   tx.Commit()
+   s.cache.Set(idempotencyKey, order)
+   respondJSON(w, order)
+}
+
+// 3. Outbox Processor
+type OutboxProcessor struct {
+   kafkaProducer *KafkaProducer
+   db           *DB
+}
+
+func (p *OutboxProcessor) SaveEvent(tx *Tx, event Event) error {
+   // Сохранение в таблицу outbox
+   return tx.Exec(
+      "INSERT INTO outbox (event_type, payload, saga_id, idempotency_key) VALUES (?, ?, ?, ?)",
+      event.Type, event.Payload, event.SagaID, event.IdempotencyKey,
+   ).Error
+}
+
+func (p *OutboxProcessor) ProcessOutbox() {
+   for {
+      // Получение необработанных событий
+      var events []Event
+      p.db.Find(&events, "processed = ?", false).Limit(100)
+
+      for _, event := range events {
+         if err := p.kafkaProducer.Publish(event); err == nil {
+            p.db.Model(&event).Update("processed", true)
+         }
+      }
+
+      time.Sleep(1 * time.Second)
+   }
+}
+
+// 4. Saga Orchestrator
+type SagaOrchestrator struct {
+   kafkaConsumer  *KafkaConsumer
+   catalogService *CatalogService
+   paymentService *PaymentService
+   orderService   *OrderService
+}
+
+func (o *SagaOrchestrator) Start() {
+   o.kafkaConsumer.Subscribe("OrderCreated", o.handleOrderCreated)
+   o.kafkaConsumer.Subscribe("ItemsReserved", o.handleItemsReserved)
+   o.kafkaConsumer.Subscribe("PaymentProcessed", o.handlePaymentProcessed)
+}
+
+func (o *SagaOrchestrator) handleOrderCreated(event Event) {
+   var order Order
+   json.Unmarshal(event.Payload.([]byte), &order)
+
+   // Вызов CatalogService через Circuit Breaker
+   if err := o.catalogService.ReserveItems(order); err != nil {
+      o.kafkaProducer.Publish(Event{
+         Type: "ReservationFailed",
+         SagaID: event.SagaID,
+      })
+      return
+   }
+}
+
+func (o *SagaOrchestrator) handleItemsReserved(event Event) {
+   var order Order
+   json.Unmarshal(event.Payload.([]byte), &order)
+
+   // Вызов PaymentService через Circuit Breaker
+   if err := o.paymentService.ProcessPayment(order); err != nil {
+      o.kafkaProducer.Publish(Event{
+         Type: "PaymentFailed",
+         SagaID: event.SagaID,
+      })
+      return
+   }
+}
+
+func (o *SagaOrchestrator) handlePaymentProcessed(event Event) {
+   // Завершение саги
+   o.orderService.CompleteOrder(event.SagaID)
+}
+
+// 5. Catalog Service
+type CatalogService struct {
+   db *DB
+   cb *CircuitBreaker
+}
+
+func (s *CatalogService) ReserveItems(order Order) error {
+   result := s.cb.Execute(func() (interface{}, error) {
+      // Проверка наличия и резервирование
+      for _, item := range order.Items {
+         if err := s.db.Exec(
+            "UPDATE items SET quantity = quantity - ? WHERE id = ? AND quantity >= ?",
+            item.Quantity, item.ID, item.Quantity,
+         ).Error; err != nil {
+            return nil, err
+         }
+      }
+      return nil, nil
+   })
+
+   if result.Err != nil {
+      return result.Err
+   }
+
+   // Публикация события
+   return s.outboxProcessor.SaveEvent(Event{
+      Type:    "ItemsReserved",
+      Payload: order,
+      SagaID:  order.ID,
+   })
+}
+
+// 6. Payment Service
+type PaymentService struct {
+   db           *DB
+   cb           *CircuitBreaker
+   processedKeys *IdempotencyCache
+}
+
+func (s *PaymentService) ProcessPayment(order Order) error {
+   // Проверка идемпотентности
+   if _, exists := s.processedKeys.Get(order.ID); exists {
+      return nil
+   }
+
+   result := s.cb.Execute(func() (interface{}, error) {
+      // Обработка платежа
+      if err := s.db.Exec(
+         "INSERT INTO payments (order_id, amount, status) VALUES (?, ?, ?)",
+         order.ID, order.Amount, "processed",
+      ).Error; err != nil {
+         return nil, err
+      }
+      return nil, nil
+   })
+
+   if result.Err != nil {
+      return result.Err
+   }
+
+   s.processedKeys.Set(order.ID, true)
+   return s.outboxProcessor.SaveEvent(Event{
+      Type:    "PaymentProcessed",
+      Payload: order,
+      SagaID:  order.ID,
+   })
+}
+
+// 7. Вспомогательные компоненты (реализации)
+type CircuitBreaker struct { /* ... */ }
+type IdempotencyCache struct { /* ... */ }
+type KafkaProducer struct{ /* ... */ }
+type KafkaConsumer struct{ /* ... */ }
+type DB struct{ /* ... */ }
+type Tx struct{ /* ... */ }
+
+func main() {
+   // Инициализация всех компонентов
+   db := &DB{}
+   kafkaProducer := &KafkaProducer{}
+   kafkaConsumer := &KafkaConsumer{}
+
+   orderService := &OrderService{
+      db: db,
+      outboxProcessor: &OutboxProcessor{
+         kafkaProducer: kafkaProducer,
+         db:           db,
+      },
+      cache: NewIdempotencyCache(24 * time.Hour),
+   }
+
+   sagaOrchestrator := &SagaOrchestrator{
+      kafkaConsumer: kafkaConsumer,
+      catalogService: &CatalogService{
+         db: db,
+         cb: NewCircuitBreaker(3, 30*time.Second),
+      },
+      paymentService: &PaymentService{
+         db:           db,
+         cb:           NewCircuitBreaker(3, 30*time.Second),
+         processedKeys: NewIdempotencyCache(24 * time.Hour),
+      },
+      orderService: orderService,
+   }
+
+   // Запуск обработчиков
+   go orderService.outboxProcessor.ProcessOutbox()
+   go sagaOrchestrator.Start()
+
+   // HTTP сервер
+   http.HandleFunc("/orders", orderService.CreateOrder)
+   http.ListenAndServe(":8080", nil)
+}
+```
+
+```shell
+curl -X POST http://localhost:8080/orders \
+  -H "Idempotency-Key: abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"user1","amount":100,"items":[{"id":"item1","quantity":2}]}'
 ```
 
 ### Архитектурная диаграмма
@@ -997,29 +1288,36 @@ graph TB
 package main
 
 // Command Side
-type CreateOrderCommand struct {
-    UserID uuid.UUID
-    Items  []OrderItem
-}
-
 type OrderCommandHandler struct {
-    eventStore EventStore
+   eventStore EventStore
 }
 
-func (h *OrderCommandHandler) Handle(cmd CreateOrderCommand) error {
-    events := []Event{
-        NewEvent("OrderCreated", cmd),
-    }
-    return h.eventStore.Append(events)
+func (h *OrderCommandHandler) HandleCreateOrder(cmd CreateOrderCommand) error {
+   events := []Event{
+      NewEvent("OrderCreated", cmd),
+   }
+   return h.eventStore.Append(cmd.OrderID, events)
 }
 
 // Query Side
-type OrderReadModel struct {
-    db *sql.DB
+type OrderQueryHandler struct {
+   readModel *OrderReadModel
 }
 
-func (r *OrderReadModel) GetByID(id uuid.UUID) (OrderView, error) {
-    // Query from optimized read storage
+func (h *OrderQueryHandler) HandleGetOrder(query GetOrderQuery) (*OrderView, error) {
+   return h.readModel.GetByID(query.OrderID)
+}
+
+// Read Model Projection
+func (p *OrderProjection) ApplyOrderCreated(event Event) error {
+   var order OrderCreatedEvent
+   json.Unmarshal(event.Data, &order)
+
+   return p.db.Exec(`
+        INSERT INTO order_view (id, user_id, amount, status) 
+        VALUES (?, ?, ?, 'created')`,
+      order.ID, order.UserID, order.Amount,
+   ).Error
 }
 ```
 
