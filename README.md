@@ -5,17 +5,4 @@ Domain Driven Design, SAGA, Event-Sourcing &amp; CQRS
 
 ### Архитектура SAGA
 
-```sequence
-sequenceDiagram
-    participant Client
-    participant OrderService
-    participant CatalogService
-    participant PaymentService
-
-    Client->>OrderService: Создать заказ (POST /orders)
-    OrderService->>CatalogService: Резервировать товары (PUT /catalog/reserve)
-    CatalogService-->>OrderService: Товары зарезервированы
-    OrderService->>PaymentService: Списать средства (POST /payment/charge)
-    PaymentService-->>OrderService: Платеж успешен
-    OrderService->>Client: Заказ подтвержден
-```
+<img src="./static/diagrams/saga_1.svg" alt="saga_first_overview">
