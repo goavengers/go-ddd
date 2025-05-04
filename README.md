@@ -1400,41 +1400,308 @@ graph LR
 ```go
 package main
 
-// todo
+package main
+
+import (
+"encoding/json"
+"errors"
+"fmt"
+"net/http"
+"sync"
+"time"
+)
+
+// 1. Основные структуры данных (Event Sourcing)
+type Event struct {
+   ID            string      `json:"id"`
+   Type          string      `json:"type"`
+   AggregateID   string      `json:"aggregate_id"` // Для Event Sourcing
+   AggregateType string      `json:"aggregate_type"`
+   Payload       interface{} `json:"payload"`
+   Version       int         `json:"version"`
+   Timestamp     time.Time   `json:"timestamp"`
+}
+
+type OrderAggregate struct {
+   ID      string
+   Version int
+   State   OrderState
+}
+
+type OrderState struct {
+   UserID string
+   Amount float64
+   Items  []Item
+   Status string
+}
+
+type Item struct {
+   ID       string `json:"id"`
+   Quantity int    `json:"quantity"`
+}
+
+// 2. Event Store (Event Sourcing)
+type EventStore interface {
+   Append(event Event) error
+   GetStream(aggregateID string) ([]Event, error)
+}
+
+type MemoryEventStore struct {
+   events map[string][]Event
+   mu     sync.RWMutex
+}
+
+func (s *MemoryEventStore) Append(event Event) error {
+   s.mu.Lock()
+   defer s.mu.Unlock()
+   s.events[event.AggregateID] = append(s.events[event.AggregateID], event)
+   return nil
+}
+
+func (s *MemoryEventStore) GetStream(aggregateID string) ([]Event, error) {
+   s.mu.RLock()
+   defer s.mu.RUnlock()
+   return s.events[aggregateID], nil
+}
+
+// 3. Command и Query обработчики (CQRS)
+type CommandHandler struct {
+   eventStore EventStore
+}
+
+func (h *CommandHandler) HandleCreateOrder(cmd CreateOrderCommand) error {
+   events := []Event{
+      {
+         ID:            generateUUID(),
+         Type:          "OrderCreated",
+         AggregateID:   cmd.OrderID,
+         AggregateType: "Order",
+         Payload:       cmd,
+         Version:       1,
+         Timestamp:     time.Now(),
+      },
+   }
+   return h.eventStore.Append(events[0])
+}
+
+type QueryHandler struct {
+   readModel *OrderReadModel
+}
+
+func (h *QueryHandler) HandleGetOrder(query GetOrderQuery) (*OrderView, error) {
+   return h.readModel.GetByID(query.OrderID)
+}
+
+// 4. Read Model Projection (CQRS)
+type OrderReadModel struct {
+   db *DB
+}
+
+func (p *OrderReadModel) ApplyEvent(event Event) error {
+   switch event.Type {
+   case "OrderCreated":
+      var cmd CreateOrderCommand
+      json.Unmarshal(event.Payload.([]byte), &cmd)
+      return p.db.Exec(`
+			INSERT INTO order_view (id, user_id, amount, status) 
+			VALUES (?, ?, ?, 'created')`,
+         cmd.OrderID, cmd.UserID, cmd.Amount,
+      ).Error
+   case "OrderCompleted":
+      return p.db.Exec(`
+			UPDATE order_view SET status = 'completed' WHERE id = ?`,
+         event.AggregateID,
+      ).Error
+   }
+   return nil
+}
+
+// 5. Order Service (с Event Sourcing)
+type OrderService struct {
+   commandHandler *CommandHandler
+   queryHandler   *QueryHandler
+   eventStore     EventStore
+   outboxProcessor *OutboxProcessor
+   cache          *IdempotencyCache
+}
+
+func (s *OrderService) CreateOrder(w http.ResponseWriter, r *http.Request) {
+   idempotencyKey := r.Header.Get("Idempotency-Key")
+   if idempotencyKey == "" {
+      idempotencyKey = generateUUID()
+   }
+
+   if cached, exists := s.cache.Get(idempotencyKey); exists {
+      respondJSON(w, cached)
+      return
+   }
+
+   var cmd CreateOrderCommand
+   if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
+      http.Error(w, err.Error(), http.StatusBadRequest)
+      return
+   }
+
+   // Сохраняем событие в Event Store
+   if err := s.commandHandler.HandleCreateOrder(cmd); err != nil {
+      http.Error(w, err.Error(), http.StatusInternalServerError)
+      return
+   }
+
+   // Сохраняем в Outbox для Saga
+   event := Event{
+      Type:          "OrderCreated",
+      Payload:       cmd,
+      SagaID:        cmd.OrderID,
+      IdempotencyKey: idempotencyKey,
+   }
+   if err := s.outboxProcessor.SaveEvent(nil, event); err != nil {
+      http.Error(w, err.Error(), http.StatusInternalServerError)
+      return
+   }
+
+   s.cache.Set(idempotencyKey, cmd)
+   respondJSON(w, cmd)
+}
+
+// 6. Обновленный Saga Orchestrator с Event Sourcing
+type SagaOrchestrator struct {
+   kafkaConsumer  *KafkaConsumer
+   eventStore     EventStore
+   commandHandler *CommandHandler
+}
+
+func (o *SagaOrchestrator) handlePaymentProcessed(event Event) {
+   // Создаем событие завершения заказа
+   completeEvent := Event{
+      Type:          "OrderCompleted",
+      AggregateID:   event.SagaID,
+      AggregateType: "Order",
+      Payload:       nil,
+      Version:       getNextVersion(o.eventStore, event.SagaID),
+      Timestamp:     time.Now(),
+   }
+
+   if err := o.eventStore.Append(completeEvent); err != nil {
+      // Обработка ошибки
+      return
+   }
+
+   // Отправляем команду на завершение заказа
+   o.commandHandler.HandleCompleteOrder(CompleteOrderCommand{
+      OrderID: event.SagaID,
+   })
+}
+
+// 7. Catalog Service с Event Sourcing
+type CatalogService struct {
+   eventStore EventStore
+   cb         *CircuitBreaker
+}
+
+func (s *CatalogService) ReserveItems(order Order) error {
+   // Загружаем текущее состояние
+   events, err := s.eventStore.GetStream(order.ID)
+   if err != nil {
+      return err
+   }
+
+   // Восстанавливаем агрегат
+   aggregate := ReconstructAggregate(events)
+
+   // Проверяем доступность товаров
+   for _, item := range order.Items {
+      if !aggregate.HasItem(item.ID, item.Quantity) {
+         return errors.New("not enough items")
+      }
+   }
+
+   // Генерируем событие резерва
+   reserveEvent := Event{
+      Type:          "ItemsReserved",
+      AggregateID:   order.ID,
+      AggregateType: "Order",
+      Payload:       order,
+      Version:       len(events) + 1,
+      Timestamp:     time.Now(),
+   }
+
+   return s.eventStore.Append(reserveEvent)
+}
+
+// 8. Main с инициализацией всех компонентов
+func main() {
+   eventStore := &MemoryEventStore{events: make(map[string][]Event)}
+   readModel := &OrderReadModel{db: &DB{}}
+
+   // Инициализация CQRS
+   commandHandler := &CommandHandler{eventStore: eventStore}
+   queryHandler := &QueryHandler{readModel: readModel}
+
+   // Инициализация OrderService
+   orderService := &OrderService{
+      commandHandler: commandHandler,
+      queryHandler:   queryHandler,
+      eventStore:     eventStore,
+      outboxProcessor: &OutboxProcessor{
+         kafkaProducer: &KafkaProducer{},
+         db:           &DB{},
+      },
+      cache: NewIdempotencyCache(24 * time.Hour),
+   }
+
+   // Инициализация Saga Orchestrator
+   sagaOrchestrator := &SagaOrchestrator{
+      kafkaConsumer:  &KafkaConsumer{},
+      eventStore:     eventStore,
+      commandHandler: commandHandler,
+   }
+
+   // Запуск обработчиков событий
+   go func() {
+      for {
+         events, _ := eventStore.GetStream("all")
+         for _, event := range events {
+            readModel.ApplyEvent(event)
+         }
+         time.Sleep(1 * time.Second)
+      }
+   }()
+
+   // HTTP сервер
+   http.HandleFunc("/orders", orderService.CreateOrder)
+   http.HandleFunc("/orders/", func(w http.ResponseWriter, r *http.Request) {
+      id := extractIDFromURL(r.URL.Path)
+      order, _ := queryHandler.HandleGetOrder(GetOrderQuery{OrderID: id})
+      respondJSON(w, order)
+   })
+
+   http.ListenAndServe(":8080", nil)
+}
 ```
 
 ### Диаграмма последовательности
 
-<img src="./static/diagrams/es-cqrs-2.svg" alt="es_cqrs_2_overview">
+<img src="./static/diagrams/saga_7.svg" alt="es_cqrs_7_overview">
 
 ```sequence
 sequenceDiagram
     participant Client
-    participant CommandAPI
-    participant CommandHandler
+    participant OrderService
     participant EventStore
-    participant EventProcessor
+    participant OutboxProcessor
+    participant Kafka
+    participant SagaOrchestrator
     participant ReadModel
-    participant QueryAPI
 
-    Client->>CommandAPI: POST /orders (Command)
-    CommandAPI->>CommandHandler: CreateOrderCommand
-    CommandHandler->>EventStore: Append Events[OrderCreated]
-    EventStore-->>CommandHandler: Success
-    CommandHandler-->>CommandAPI: 202 Accepted
-    CommandAPI-->>Client: 202 Accepted
-
-    loop Async Processing
-        EventProcessor->>EventStore: Poll New Events
-        EventStore-->>EventProcessor: OrderCreatedEvent
-        EventProcessor->>ReadModel: Update Projection
-        EventProcessor->>ReadModel: Update MaterializedView
-    end
-
-    Client->>QueryAPI: GET /orders/{id} (Query)
-    QueryAPI->>ReadModel: GetOrderView
-    ReadModel-->>QueryAPI: OrderView
-    QueryAPI-->>Client: 200 OK (DTO)
+    Client->>OrderService: POST /orders
+    OrderService->>EventStore: Append OrderCreated
+    OrderService->>OutboxProcessor: Save event
+    OutboxProcessor->>Kafka: Publish OrderCreated
+    Kafka->>SagaOrchestrator: OrderCreated
+    SagaOrchestrator->>EventStore: Append ItemsReserved
+    EventStore->>ReadModel: Project events
+    ReadModel-->>Client: Order view
 ```
 
 ### Текстовая версия диаграммы:

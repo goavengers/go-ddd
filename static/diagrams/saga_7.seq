@@ -1,0 +1,17 @@
+sequenceDiagram
+    participant Client
+    participant OrderService
+    participant EventStore
+    participant OutboxProcessor
+    participant Kafka
+    participant SagaOrchestrator
+    participant ReadModel
+
+    Client->>OrderService: POST /orders
+    OrderService->>EventStore: Append OrderCreated
+    OrderService->>OutboxProcessor: Save event
+    OutboxProcessor->>Kafka: Publish OrderCreated
+    Kafka->>SagaOrchestrator: OrderCreated
+    SagaOrchestrator->>EventStore: Append ItemsReserved
+    EventStore->>ReadModel: Project events
+    ReadModel-->>Client: Order view
