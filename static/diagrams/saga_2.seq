@@ -1,0 +1,12 @@
+sequenceDiagram
+    participant OrderService
+    participant Kafka
+    participant CatalogService
+    participant PaymentService
+
+    OrderService->>Kafka: OrderCreated (SAGA_START)
+    Kafka->>CatalogService: ReserveItems
+    CatalogService->>Kafka: ItemsReserved / ReserveFailed
+    Kafka->>PaymentService: ChargePayment (если ReserveSuccess)
+    PaymentService->>Kafka: PaymentProcessed / PaymentFailed
+    Kafka->>OrderService: SAGA_COMPLETE / SAGA_ROLLBACK

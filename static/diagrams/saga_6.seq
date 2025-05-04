@@ -1,0 +1,6 @@
+graph LR
+    A[Order] -->|Events| B[Kafka]
+    B --> C[Catalog]
+    B --> D[Payment]
+    C --> B
+    D --> B

@@ -1,0 +1,5 @@
+graph TB
+    A[Command] --> B[Command Handler]
+    B --> C[Event Store]
+    C --> D[Read Model]
+    E[Query] --> F[Read Model]

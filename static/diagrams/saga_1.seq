@@ -1,0 +1,12 @@
+sequenceDiagram
+    participant Client
+    participant OrderService
+    participant CatalogService
+    participant PaymentService
+
+    Client->>OrderService: Создать заказ (POST /orders)
+    OrderService->>CatalogService: Резервировать товары (PUT /catalog/reserve)
+    CatalogService-->>OrderService: Товары зарезервированы
+    OrderService->>PaymentService: Списать средства (POST /payment/charge)
+    PaymentService-->>OrderService: Платеж успешен
+    OrderService->>Client: Заказ подтвержден

@@ -1,0 +1,12 @@
+graph TD
+    A[Client] --> B[Order Service]
+    B --> C[Catalog Service]
+    B --> D[Payment Service]
+    B --> E[(Outbox DB)]
+    C --> F[(Catalog DB)]
+    D --> G[(Payment DB)]
+    B --> H[Kafka]
+    C --> H
+    D --> H
+    H --> I[SAGA Orchestrator]
+    I --> B

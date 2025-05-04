@@ -1,0 +1,4 @@
+graph TD
+    A[Client] --> B[Order Service]
+    B --> C[Catalog Service]
+    B --> D[Payment Service]

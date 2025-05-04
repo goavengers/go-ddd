@@ -1,0 +1,10 @@
+graph LR
+    A[Client] --> B[Command]
+    B --> C[Command Handler]
+    C --> D[Event Store]
+    D --> E[Event Processor]
+    E --> F[Read Model]
+    A --> G[Query]
+    G --> F
+    E --> H[Projections]
+    H --> I[Analytics DB]

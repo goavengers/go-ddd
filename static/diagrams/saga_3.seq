@@ -1,0 +1,18 @@
+sequenceDiagram
+    participant Client
+    participant OrderService
+    participant CatalogService
+    participant PaymentService
+    participant Kafka
+    participant OutboxTable
+
+    Client->>OrderService: POST /orders (idempotency-key: XYZ123)
+    OrderService->>OutboxTable: Сохранить OrderCreatedEvent
+    OrderService->>Kafka: OrderCreated (SAGA_START)
+    Kafka->>CatalogService: ReserveItems (через CB)
+    CatalogService->>OutboxTable: Сохранить ItemsReservedEvent
+    CatalogService->>Kafka: ItemsReserved
+    Kafka->>PaymentService: ChargePayment (через CB)
+    PaymentService->>OutboxTable: Сохранить PaymentProcessedEvent
+    PaymentService->>Kafka: PaymentProcessed
+    Kafka->>OrderService: SAGA_COMPLETE

@@ -1,0 +1,28 @@
+sequenceDiagram
+    participant Client
+    participant OrderService
+    participant CatalogService
+    participant PaymentService
+    participant Kafka
+    participant OutboxProcessor
+
+    Client->>OrderService: POST /orders
+    OrderService->>OrderService: Генерирует Idempotency Key
+    OrderService->>OrderService: Сохраняет заказ в БД
+    OrderService->>OutboxProcessor: OrderCreated (Outbox)
+    OutboxProcessor->>Kafka: OrderCreated
+    Kafka->>SagaOrchestrator: OrderCreated
+    SagaOrchestrator->>CatalogService: ReserveItems
+    CatalogService->>CatalogService: Проверяет наличие
+    CatalogService->>CatalogService: Резервирует товары
+    CatalogService->>OutboxProcessor: ItemsReserved (Outbox)
+    OutboxProcessor->>Kafka: ItemsReserved
+    Kafka->>SagaOrchestrator: ItemsReserved
+    SagaOrchestrator->>PaymentService: ProcessPayment
+    PaymentService->>PaymentService: Обрабатывает платеж
+    PaymentService->>OutboxProcessor: PaymentProcessed (Outbox)
+    OutboxProcessor->>Kafka: PaymentProcessed
+    Kafka->>SagaOrchestrator: PaymentProcessed
+    SagaOrchestrator->>OrderService: CompleteOrder
+    OrderService->>OrderService: Обновляет статус заказа
+    OrderService->>Client: 200 OK
