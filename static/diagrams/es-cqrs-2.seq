@@ -1,0 +1,27 @@
+sequenceDiagram
+    participant Client
+    participant CommandAPI
+    participant CommandHandler
+    participant EventStore
+    participant EventProcessor
+    participant ReadModel
+    participant QueryAPI
+
+    Client->>CommandAPI: POST /orders (Command)
+    CommandAPI->>CommandHandler: CreateOrderCommand
+    CommandHandler->>EventStore: Append Events[OrderCreated]
+    EventStore-->>CommandHandler: Success
+    CommandHandler-->>CommandAPI: 202 Accepted
+    CommandAPI-->>Client: 202 Accepted
+
+    loop Async Processing
+        EventProcessor->>EventStore: Poll New Events
+        EventStore-->>EventProcessor: OrderCreatedEvent
+        EventProcessor->>ReadModel: Update Projection
+        EventProcessor->>ReadModel: Update MaterializedView
+    end
+
+    Client->>QueryAPI: GET /orders/{id} (Query)
+    QueryAPI->>ReadModel: GetOrderView
+    ReadModel-->>QueryAPI: OrderView
+    QueryAPI-->>Client: 200 OK (DTO)

@@ -1,0 +1,8 @@
+timeline
+    title Временная диаграмма согласованности
+    section Запись
+    Command : 0 ms
+    Event Store : 50 ms
+    ReadModel Update : 100-500 ms
+    section Чтение
+    Query : После 500 ms (strong consistency)

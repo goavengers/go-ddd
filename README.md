@@ -389,6 +389,100 @@ package main
 // todo
 ```
 
+#### 4.3.3. Диаграмма последовательности
+
+<img src="./static/diagrams/es-cqrs-2.svg" alt="es_cqrs_2_overview">
+
+```sequence
+sequenceDiagram
+    participant Client
+    participant CommandAPI
+    participant CommandHandler
+    participant EventStore
+    participant EventProcessor
+    participant ReadModel
+    participant QueryAPI
+
+    Client->>CommandAPI: POST /orders (Command)
+    CommandAPI->>CommandHandler: CreateOrderCommand
+    CommandHandler->>EventStore: Append Events[OrderCreated]
+    EventStore-->>CommandHandler: Success
+    CommandHandler-->>CommandAPI: 202 Accepted
+    CommandAPI-->>Client: 202 Accepted
+
+    loop Async Processing
+        EventProcessor->>EventStore: Poll New Events
+        EventStore-->>EventProcessor: OrderCreatedEvent
+        EventProcessor->>ReadModel: Update Projection
+        EventProcessor->>ReadModel: Update MaterializedView
+    end
+
+    Client->>QueryAPI: GET /orders/{id} (Query)
+    QueryAPI->>ReadModel: GetOrderView
+    ReadModel-->>QueryAPI: OrderView
+    QueryAPI-->>Client: 200 OK (DTO)
+```
+
+#### 4.3.4. Текстовая версия диаграммы:
+
+> 1. Клиент отправляет команду:
+>
+>    `Client → CommandAPI: POST /orders {items: [...]}`
+> 2. Command API перенаправляет команду обработчику:
+>
+>    `CommandAPI → CommandHandler: CreateOrderCommand`
+> 3. Обработчик сохраняет события:
+>
+>    `CommandHandler → EventStore: Append [OrderCreatedEvent]`
+> 4. EventStore подтверждает запись:
+>
+>    `EventStore → CommandHandler: Success`
+> 5. Клиент получает подтверждение:
+>
+>    `CommandHandler → CommandAPI → Client: 202 Accepted`
+> 6. Фоновый процесс обработки событий:
+>    - **EventProcessor** периодически опрашивает **EventStore**
+>    - Получает новые события (`OrderCreatedEvent`)
+>    - Обновляет проекции в **ReadModel**
+> 7. Клиент запрашивает данные:
+>
+>    `Client → QueryAPI: GET /orders/123`
+> 8. Query API получает данные из ReadModel:
+>
+>    `QueryAPI → ReadModel: GetOrderView(123)`
+> 9. Данные возвращаются клиенту:
+>
+>    `ReadModel → QueryAPI → Client: OrderViewDTO`
+
+#### 4.3.5. Ключевые особенности потока:
+
+1. **Разделение путей записи и чтения:**
+    - Запись идет через Command Stack (левая часть)
+    - Чтение через Query Stack (правая часть)
+
+2. **Асинхронная обработка:**
+    - Обновление ReadModel происходит после фиксации событий
+    - Задержка между записью и консистентностью чтения (Eventual Consistency)
+3. **Компоненты:**
+    - `EventStore` - хранилище событий (например, Kafka+PostgreSQL)
+    - `EventProcessor` - подписчик на события (Consumer)
+    - `ReadModel` - оптимизированное хранилище для чтения (MongoDB/Elasticsearch)
+
+#### 4.3.6. Типовые задержки:
+
+<img src="./static/diagrams/es-cqrs-latency.svg" alt="es_cqrs_3_overview">
+
+```timeline
+timeline
+    title Временная диаграмма согласованности
+    section Запись
+    Command : 0 ms
+    Event Store : 50 ms
+    ReadModel Update : 100-500 ms
+    section Чтение
+    Query : После 500 ms (strong consistency)
+```
+
 ### 5. Сравнительный анализ
 
 | Критерий               | SAGA                | Event Sourcing      | CQRS                | ES+CQRS             |
