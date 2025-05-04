@@ -1,0 +1,17 @@
+sequenceDiagram
+    participant C as Coordinator
+    participant P1 as Participant1
+    participant P2 as Participant2
+
+    C->>P1: Prepare()
+    C->>P2: Prepare()
+    P1-->>C: OK/Error
+    P2-->>C: OK/Error
+
+    alt Все успешно
+        C->>P1: Commit()
+        C->>P2: Commit()
+    else Ошибка подготовки
+        C->>P1: Rollback()
+        C->>P2: Rollback()
+    end
